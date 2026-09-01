@@ -10,6 +10,7 @@ app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'aivorah-stu
 
 app.use('/teacher', require('./routes/teacher'));
 app.use('/student', require('./routes/student'));
+app.use('/parent', require('./routes/parent'));
 
 const PORT = process.env.PORT || 3017;
 if (require.main === module) {

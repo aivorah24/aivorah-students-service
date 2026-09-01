@@ -1,0 +1,68 @@
+const { makeSupabaseMock } = require('../helpers/supabaseMock');
+const mockSb = makeSupabaseMock();
+jest.mock('../../services/supabase', () => mockSb.supabase);
+
+const request = require('supertest');
+const app = require('../../index');
+
+beforeEach(() => {
+  mockSb.reset();
+  global.fetch = jest.fn();
+});
+
+describe('GET /student/:id', () => {
+  test('returns stats with totalTopics from learning-paths-service', async () => {
+    mockSb.setTable('users', {
+      data: { curriculum: 'CBSE', grade: 'Grade 11' },
+      error: null,
+    });
+    mockSb.setTable('student_stats', {
+      data: { student_id: 'child-1', xp_points: 500, level: 2, current_streak: 4, study_time_minutes: 120, completed_topics: ['a', 'b'], last_active_date: new Date().toISOString().split('T')[0] },
+      error: null,
+    });
+    mockSb.setTable('challenge_assignments', {
+      count: 5,
+      error: null,
+    });
+    global.fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ totalTopics: 42 }) });
+
+    const res = await request(app).get('/student/child-1');
+
+    expect(res.status).toBe(200);
+    expect(res.body.xpPoints).toBe(500);
+    expect(res.body.totalTopics).toBe(42);
+    expect(res.body.challengesCompleted).toBe(5);
+  });
+});
+
+describe('GET /student/:id/weekly', () => {
+  test('returns weekly data', async () => {
+    mockSb.setTable('student_daily_log', {
+      data: [],
+      error: null,
+    });
+
+    const res = await request(app).get('/student/child-1/weekly');
+    
+
+    expect(res.status).toBe(200);
+    expect(res.body.days).toHaveLength(7);
+  });
+});
+
+describe('GET /student/:id/mistake-trends', () => {
+  test('returns mistake trends', async () => {
+    mockSb.setTable('topic_attempts', {
+      data: [
+        { topic: 'Math', subject: 'Math', grade: 'Grade 3', attempt_number: 1, score: 50, passed: false, time_spent_seconds: 60, created_at: '2026-09-01T00:00:00Z', per_question_results: [{ question: '1+1', isCorrect: false, studentAnswer: '3', correctAnswer: '2' }] }
+      ],
+      error: null,
+    });
+
+    const res = await request(app).get('/student/child-1/mistake-trends');
+
+    expect(res.status).toBe(200);
+    expect(res.body.topics).toHaveLength(1);
+    expect(res.body.recentMistakes).toHaveLength(1);
+  });
+});

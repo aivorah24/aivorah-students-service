@@ -27,6 +27,8 @@ function makeSupabaseMock() {
       neq: jest.fn(() => chain),
       order: jest.fn(() => chain),
       limit: jest.fn(() => chain),
+      gte: jest.fn(() => chain),
+      lte: jest.fn(() => chain),
       upsert: jest.fn(() => chain),
       update: jest.fn(() => chain),
       insert: jest.fn(() => chain),

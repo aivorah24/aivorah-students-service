@@ -2,9 +2,53 @@ const express  = require('express');
 const router   = express.Router();
 const supabase = require('../services/supabase');
 const Groq     = require('groq-sdk');
+const { randomUUID } = require('crypto');
 const { computeLearningProfile, humanizeTopic, sanitizeReport } = require('../services/learningProfile');
+const { generateSecurePassword, toTitleCase } = require('../services/studentAccounts');
+const { sendCredentialsEmail, sendEmailOtpCode } = require('../services/mailer');
+const otpStore = require('../services/otpStore');
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+// Same @aivorah.student login-ID scheme the monolith used, kept identical so
+// existing accounts created there stay consistent with new ones created here.
+async function generateChildLoginId(parentEmail) {
+  if (parentEmail) {
+    const localPart = parentEmail.split('@')[0].toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+    for (let n = 1; n < 100; n++) {
+      const candidate = `${localPart}_ch${n}@aivorah.student`;
+      const { data: existing } = await supabase.from('users').select('id').eq('email', candidate).maybeSingle();
+      if (!existing) return candidate;
+    }
+  }
+  for (let n = 1; n < 100000; n++) {
+    const candidate = `ch${n}@aivorah.student`;
+    const { data: existing } = await supabase.from('users').select('id').eq('email', candidate).maybeSingle();
+    if (!existing) return candidate;
+  }
+  return `ch${Date.now()}@aivorah.student`;
+}
+
+async function setStudentMeta(email, studentId, parentEmail, firebaseUid, initialPassword) {
+  const emailKey = String(email || '').toLowerCase().trim();
+  if (!emailKey) return;
+  const { data: existing } = await supabase
+    .from('user_preferences').select('data').eq('user_email', emailKey).maybeSingle();
+  const merged = {
+    ...(existing?.data || {}),
+    studentId,
+    createdByParent: String(parentEmail || '').toLowerCase().trim(),
+    firebaseUid: String(firebaseUid || '').trim() || undefined,
+    accountStatus: 'active',
+    activatedAt: existing?.data?.activatedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    ...(initialPassword ? { initialPassword, passwordSavedAt: new Date().toISOString(), mustChangePassword: true } : {}),
+  };
+  await supabase.from('user_preferences').upsert(
+    { user_email: emailKey, data: merged, updated_at: new Date().toISOString() },
+    { onConflict: 'user_email' },
+  );
+}
 
 // Curriculum/content domain owns Qdrant (see aivorah-learning-paths-service) -
 // this service asks it for each child's totalTopics over HTTP instead of
@@ -357,6 +401,208 @@ ABSOLUTE RULES — breaking even one makes the report invalid:
   } catch (err) {
     console.error('[ai-report]', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /parent/children/init-auth ────────────────────────
+// Prepare child credentials for onboarding Step 4. Ported from the
+// monolith's ai-mentor/server/routes/parent.js (same route, same response
+// shape) - part of moving parent-onboarding child creation off the
+// monolith, which had no test-environment Supabase project (root cause of
+// a real incident: an E2E test run wrote a real child account into Prod
+// via this route's old monolith copy, 2026-09-05).
+router.post(['/children/init-auth', '/:parentEmail/children/init-auth'], async (req, res) => {
+  try {
+    const { name, email, studentId, password: customPassword, parentEmail: bodyParentEmail } = req.body || {};
+    if (!name) return res.status(400).json({ error: 'name is required' });
+
+    const parentEmail = req.params.parentEmail || bodyParentEmail || '';
+    const emailProvided = Boolean(email && String(email).trim());
+    const cleanEmail = emailProvided
+      ? String(email).toLowerCase().trim()
+      : await generateChildLoginId(parentEmail);
+
+    const resolvedStudentId = String(studentId || '').trim() || `STU-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    const { data: existing } = await supabase.from('users').select('id').eq('email', cleanEmail).maybeSingle();
+    if (existing) return res.status(409).json({ error: 'An account with this email already exists.' });
+
+    const trimmedCustom = customPassword && String(customPassword).trim();
+    const generatedPassword = (trimmedCustom && trimmedCustom.length >= 6) ? trimmedCustom : generateSecurePassword();
+
+    res.json({
+      success: true,
+      childEmail: cleanEmail,
+      message: 'Login credentials generated',
+      email: cleanEmail,
+      password: generatedPassword,
+      studentId: resolvedStudentId,
+      emailProvided,
+      verificationRequired: false,
+    });
+  } catch (err) {
+    console.error('[parent/children/init-auth]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /parent/:parentEmail/children/link-created ────────
+// Links a Firebase-created student account into app DB + parent linkage.
+// Ported from the monolith - see init-auth's comment above for why.
+router.post('/:parentEmail/children/link-created', async (req, res) => {
+  try {
+    const { parentEmail } = req.params;
+    const { firebaseUid, studentId, name, email, grade, curriculum, school = '', initialPassword } = req.body || {};
+
+    if (!firebaseUid || !name || !email || !grade || !curriculum) {
+      return res.status(400).json({ error: 'firebaseUid, name, email, grade, curriculum are required' });
+    }
+
+    const cleanEmail = String(email).toLowerCase().trim();
+    const cleanName = toTitleCase(String(name).trim());
+    const cleanParentEmail = String(parentEmail).toLowerCase().trim();
+    const resolvedStudentId = String(studentId || '').trim() || `STU-${Date.now()}`;
+
+    // Prevent creating the same child (same name + grade) more than once under this parent.
+    const { data: existingChildren } = await supabase
+      .from('parent_children')
+      .select('child_id, users!parent_children_child_id_fkey(name, grade)')
+      .eq('parent_email', cleanParentEmail);
+    if (existingChildren?.length) {
+      const duplicate = existingChildren.find((row) => {
+        const child = row.users;
+        return child
+          && String(child.name || '').toLowerCase().trim() === cleanName.toLowerCase()
+          && String(child.grade || '').toLowerCase().trim() === String(grade || '').toLowerCase().trim();
+      });
+      if (duplicate) {
+        return res.status(409).json({
+          error: `A child named "${cleanName}" in ${grade} is already linked to your account. If this is a different child, use a slightly different name to distinguish them.`,
+          code: 'DUPLICATE_CHILD',
+        });
+      }
+    }
+
+    const { data: existingByEmail } = await supabase.from('users').select('id').eq('email', cleanEmail).maybeSingle();
+    const userId = existingByEmail?.id || randomUUID();
+
+    const { error: userUpsertErr } = await supabase.from('users').upsert({
+      id: userId,
+      name: cleanName,
+      email: cleanEmail,
+      role: 'student',
+      grade,
+      curriculum,
+      school: String(school || '').trim(),
+      onboarding_complete: true,
+    }, { onConflict: 'id' });
+    if (userUpsertErr) return res.status(500).json({ error: userUpsertErr.message });
+
+    const { error: linkErr } = await supabase.from('parent_children').insert({ parent_email: cleanParentEmail, child_id: userId });
+    if (linkErr && linkErr.code !== '23505') return res.status(500).json({ error: linkErr.message });
+
+    await supabase.from('student_stats').upsert({ student_id: userId }, { onConflict: 'student_id', ignoreDuplicates: true });
+
+    await setStudentMeta(cleanEmail, resolvedStudentId, cleanParentEmail, firebaseUid, initialPassword || undefined);
+
+    await sendCredentialsEmail({
+      to: cleanParentEmail, childName: cleanName, loginId: cleanEmail,
+      password: initialPassword || undefined, childEmail: cleanEmail,
+    }).catch((err) => console.log('[parent/children/link-created] parent credentials email failed (non-fatal):', err.message));
+
+    if (!cleanEmail.endsWith('@aivorah.student') && cleanEmail !== cleanParentEmail) {
+      sendCredentialsEmail({
+        to: cleanEmail, childName: cleanName, loginId: cleanEmail, password: initialPassword || undefined,
+      }).catch((err) => console.log('[parent/children/link-created] child credentials email failed (non-fatal):', err.message));
+    }
+
+    res.json({
+      success: true,
+      child: {
+        id: userId, studentId: resolvedStudentId, name: cleanName, email: cleanEmail,
+        grade, curriculum, school: String(school || '').trim(), firebaseUid,
+        onboardingComplete: true, accountStatus: 'active',
+      },
+    });
+  } catch (err) {
+    console.error('[parent/children/link-created]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /parent/:parentEmail/children ──────────────────────
+// Links an EXISTING student account (age 14+ path) to this parent, instead
+// of creating a new one. Ported from the monolith - see init-auth's
+// comment above for why.
+router.post('/:parentEmail/children', async (req, res) => {
+  try {
+    const { parentEmail } = req.params;
+    const { childEmail } = req.body || {};
+    if (!childEmail) return res.status(400).json({ error: 'childEmail required' });
+
+    const { data: child, error: lookupErr } = await supabase
+      .from('users').select('id, name, email, grade, school')
+      .eq('email', childEmail.toLowerCase().trim()).single();
+    if (lookupErr || !child) {
+      return res.status(404).json({ error: 'No student found with that email. Ask your child to register first.' });
+    }
+
+    const { error: linkErr } = await supabase.from('parent_children').insert({ parent_email: parentEmail, child_id: child.id });
+    if (linkErr) {
+      if (linkErr.code === '23505') return res.status(409).json({ error: 'This child is already linked to your account.' });
+      return res.status(500).json({ error: linkErr.message });
+    }
+
+    res.json({ success: true, child: { id: child.id, name: child.name, email: child.email, grade: child.grade, school: child.school } });
+  } catch (err) {
+    console.error('[parent/:parentEmail/children]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /parent/children/email-otp/send ────────────────────
+// ── POST /parent/children/email-otp/verify ──────────────────
+// Inline verification of a child's real email during onboarding (Step 4's
+// optional email field). Ported from the monolith's generic
+// /user/email-otp/send + /verify (ai-mentor/server/routes/user.js) as part
+// of moving the whole parent-onboarding child flow off the monolith - see
+// init-auth's comment above. Scoped under /parent/children since this
+// service's only OTP consumer is this exact flow, unlike the monolith's
+// route which also serves email-change/recovery elsewhere (left on the
+// monolith, out of scope here).
+router.post('/children/email-otp/send', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const name = req.body?.name ? String(req.body.name) : 'there';
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    await otpStore.setOtp(email, 'email_verify', { otp });
+    await sendEmailOtpCode({ to: email, otp, name });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[parent/children/email-otp/send]', err.message);
+    res.status(500).json({ error: 'Could not send the verification code. Please try again.' });
+  }
+});
+
+router.post('/children/email-otp/verify', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const otp = String(req.body?.otp || '').trim();
+    const stored = await otpStore.getOtp(email, 'email_verify');
+    if (!stored) return res.status(400).json({ error: 'No code requested. Please send a code first.' });
+    if (Date.now() > stored.expiresAt) {
+      await otpStore.deleteOtp(email, 'email_verify');
+      return res.status(400).json({ error: 'Code expired. Please request a new one.' });
+    }
+    if (stored.otp !== otp) return res.status(400).json({ error: 'Incorrect code. Please try again.' });
+    await otpStore.deleteOtp(email, 'email_verify');
+    res.json({ verified: true });
+  } catch (err) {
+    console.error('[parent/children/email-otp/verify]', err.message);
+    res.status(500).json({ error: 'Verification failed. Please try again.' });
   }
 });
 

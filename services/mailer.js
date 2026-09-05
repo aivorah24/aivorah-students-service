@@ -281,4 +281,32 @@ async function sendOwnAccountCredentialsEmail({ to, name, loginId, password, rol
   }
 }
 
-module.exports = { sendCredentialsEmail, sendBulkCredentialsEmail, sendOwnAccountCredentialsEmail };
+// Ported from ai-mentor/server/services/mailer.js's sendEmailOtpCode - used
+// by routes/parent.js's child-email-verification OTP routes.
+async function sendEmailOtpCode({ to, otp, name }) {
+  if (!to || !otp) return;
+  return sendEmail({
+    to,
+    subject: 'Your Aivorah verification code',
+    html: `
+      <div style="font-family:sans-serif;max-width:500px;margin:0 auto;padding:24px;background:#fff">
+        <div style="background:#7C3AED;border-radius:12px;padding:24px 24px 16px;margin-bottom:24px">
+          <h1 style="margin:0;color:#fff;font-size:22px;font-weight:700">Aivorah</h1>
+          <p style="margin:8px 0 0;color:#e9d5ff;font-size:14px">Verify your email</p>
+        </div>
+        <p style="font-size:15px;color:#333;margin-bottom:4px">Hi ${name || 'there'},</p>
+        <p style="font-size:14px;color:#555;line-height:1.6">
+          Enter the code below to verify this email address on Aivorah. This code expires in <strong>10 minutes</strong>.
+        </p>
+        <div style="text-align:center;margin:32px 0">
+          <div style="display:inline-block;background:#f5f3ff;border:2px solid #7C3AED;border-radius:16px;padding:20px 48px">
+            <span style="font-size:36px;font-weight:800;color:#7C3AED;letter-spacing:10px">${otp}</span>
+          </div>
+        </div>
+        <p style="font-size:13px;color:#666;line-height:1.6">If you didn't request this, you can safely ignore this email.</p>
+      </div>
+    `,
+  });
+}
+
+module.exports = { sendCredentialsEmail, sendBulkCredentialsEmail, sendOwnAccountCredentialsEmail, sendEmailOtpCode };

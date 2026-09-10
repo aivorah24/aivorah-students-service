@@ -540,6 +540,8 @@ router.post('/:parentEmail/children', async (req, res) => {
     const { childEmail } = req.body || {};
     if (!childEmail) return res.status(400).json({ error: 'childEmail required' });
 
+    const cleanParentEmail = String(parentEmail).toLowerCase().trim();
+
     const { data: child, error: lookupErr } = await supabase
       .from('users').select('id, name, email, grade, school')
       .eq('email', childEmail.toLowerCase().trim()).single();
@@ -547,7 +549,7 @@ router.post('/:parentEmail/children', async (req, res) => {
       return res.status(404).json({ error: 'No student found with that email. Ask your child to register first.' });
     }
 
-    const { error: linkErr } = await supabase.from('parent_children').insert({ parent_email: parentEmail, child_id: child.id });
+    const { error: linkErr } = await supabase.from('parent_children').insert({ parent_email: cleanParentEmail, child_id: child.id });
     if (linkErr) {
       if (linkErr.code === '23505') return res.status(409).json({ error: 'This child is already linked to your account.' });
       return res.status(500).json({ error: linkErr.message });

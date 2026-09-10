@@ -16,6 +16,22 @@ beforeEach(() => {
   global.fetch = jest.fn();
 });
 
+describe('POST /parent/:parentEmail/children (link an existing student)', () => {
+  test('normalizes parentEmail to lowercase/trimmed before inserting the link - a mixed-case URL param must still match the lowercase rows every other insert path and the messages-service lookup use', async () => {
+    mockSb.setTable('users', { data: { id: 's1', name: 'Kid', email: 'kid@example.com', grade: 'Grade 5', school: 'Green Valley' }, error: null });
+    mockSb.setTable('parent_children', { data: null, error: null });
+
+    const res = await request(app)
+      .post('/parent/Parent@Example.com/children')
+      .send({ childEmail: 'kid@example.com' });
+
+    expect(res.status).toBe(200);
+    const insertCall = mockSb.supabase.from.mock.results
+      .find((r, i) => mockSb.supabase.from.mock.calls[i][0] === 'parent_children');
+    expect(insertCall.value.insert).toHaveBeenCalledWith({ parent_email: 'parent@example.com', child_id: 's1' });
+  });
+});
+
 describe('GET /parent/:parentEmail/children', () => {
   test('no linked children -> empty array', async () => {
     mockSb.setTable('parent_children', { data: [], error: null });

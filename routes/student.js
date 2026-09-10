@@ -1,6 +1,7 @@
 const express  = require('express');
 const router   = express.Router();
 const supabase = require('../services/supabase');
+const { normalizeGrade } = require('../services/gradeMatch');
 
 // ── GET /student/available-to-link?teacherEmail=xxx ────────
 // Returns students NOT already linked to this teacher.
@@ -57,11 +58,18 @@ router.get('/available-to-link', async (req, res) => {
       }
     }
 
+    // Grade match is done in JS (normalizeGrade), not a DB .in() on the raw
+    // string — real data has both "6" and "Grade 6" stored for the same
+    // grade (confirmed live), so an exact-string .in() silently returns zero
+    // rows whenever the teacher's stored format and the student's stored
+    // format disagree, even though every other field matches.
     let query = supabase
       .from('users')
       .select('id, name, email, grade, curriculum, photo_url, role')
-      .neq('role', 'teacher')
-      .in('grade', gradesToShow);
+      .eq('role', 'student'); // whitelist, not a "not teacher" blacklist — a
+      // non-teacher, non-student account (e.g. role: 'parent') must never be
+      // offered as a linkable "student" (confirmed live: happened for a
+      // teacher whose own account had role 'parent').
 
     if (teacher?.curriculum) query = query.eq('curriculum', teacher.curriculum);
     // School scoping: a teacher can only link students from their OWN school —
@@ -70,8 +78,12 @@ router.get('/available-to-link', async (req, res) => {
 
     const { data: candidates } = await query;
 
+    const normalizedTargetGrades = new Set(gradesToShow.map(normalizeGrade));
     const available = (candidates || [])
-      .filter(s => !linkedIds.includes(s.id) && s.name && s.role !== 'teacher')
+      // role: 'student' checked again here, not just in the query above — a
+      // whitelist at both the DB and JS layer, so nothing slips through if the
+      // Supabase query's own filter is ever bypassed or a caller mocks/stubs it.
+      .filter(s => !linkedIds.includes(s.id) && s.name && s.role === 'student' && normalizedTargetGrades.has(normalizeGrade(s.grade)))
       .map(s => ({ id: s.id, name: s.name, email: s.email, grade: s.grade, curriculum: s.curriculum, photoUrl: s.photo_url }));
 
     res.json(available);

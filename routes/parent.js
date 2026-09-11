@@ -542,10 +542,14 @@ router.post('/:parentEmail/children', async (req, res) => {
 
     const cleanParentEmail = String(parentEmail).toLowerCase().trim();
 
+    // role must be 'student' — without this filter, any registered account
+    // (a teacher's, another parent's) links successfully as if it were a
+    // child, since this was a plain email lookup. Same bug independently
+    // found and fixed in the monolith's copy of this route.
     const { data: child, error: lookupErr } = await supabase
-      .from('users').select('id, name, email, grade, school')
-      .eq('email', childEmail.toLowerCase().trim()).single();
-    if (lookupErr || !child) {
+      .from('users').select('id, name, email, grade, school, role')
+      .eq('email', childEmail.toLowerCase().trim()).maybeSingle();
+    if (lookupErr || !child || child.role !== 'student') {
       return res.status(404).json({ error: 'No student found with that email. Ask your child to register first.' });
     }
 

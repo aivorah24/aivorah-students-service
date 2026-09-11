@@ -18,7 +18,7 @@ beforeEach(() => {
 
 describe('POST /parent/:parentEmail/children (link an existing student)', () => {
   test('normalizes parentEmail to lowercase/trimmed before inserting the link - a mixed-case URL param must still match the lowercase rows every other insert path and the messages-service lookup use', async () => {
-    mockSb.setTable('users', { data: { id: 's1', name: 'Kid', email: 'kid@example.com', grade: 'Grade 5', school: 'Green Valley' }, error: null });
+    mockSb.setTable('users', { data: { id: 's1', name: 'Kid', email: 'kid@example.com', grade: 'Grade 5', school: 'Green Valley', role: 'student' }, error: null });
     mockSb.setTable('parent_children', { data: null, error: null });
 
     const res = await request(app)
@@ -29,6 +29,41 @@ describe('POST /parent/:parentEmail/children (link an existing student)', () => 
     const insertCall = mockSb.supabase.from.mock.results
       .find((r, i) => mockSb.supabase.from.mock.calls[i][0] === 'parent_children');
     expect(insertCall.value.insert).toHaveBeenCalledWith({ parent_email: 'parent@example.com', child_id: 's1' });
+  });
+
+  // Regression: this route used to look up childEmail with a plain
+  // .eq('email', ...).single() and NO role filter — any registered account
+  // (a teacher's, another parent's) linked successfully as if it were a
+  // child. Same bug independently found and fixed in the monolith's copy.
+  test('a real TEACHER email is rejected as "not found", not linked as a child', async () => {
+    mockSb.setTable('users', { data: { id: 't1', name: 'Teacher', email: 'teacher@example.com', grade: null, school: 'X', role: 'teacher' }, error: null });
+
+    const res = await request(app)
+      .post('/parent/parent@example.com/children')
+      .send({ childEmail: 'teacher@example.com' });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/no student found/i);
+  });
+
+  test('a real PARENT email is rejected as "not found", not linked as a child', async () => {
+    mockSb.setTable('users', { data: { id: 'p2', name: 'Other Parent', email: 'other-parent@example.com', grade: null, school: 'X', role: 'parent' }, error: null });
+
+    const res = await request(app)
+      .post('/parent/parent@example.com/children')
+      .send({ childEmail: 'other-parent@example.com' });
+
+    expect(res.status).toBe(404);
+  });
+
+  test('a genuinely unregistered email is rejected as "not found"', async () => {
+    mockSb.setTable('users', { data: null, error: null });
+
+    const res = await request(app)
+      .post('/parent/parent@example.com/children')
+      .send({ childEmail: 'nobody@example.com' });
+
+    expect(res.status).toBe(404);
   });
 });
 

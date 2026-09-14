@@ -29,25 +29,29 @@ function generateSecurePassword() {
   return chars.join('');
 }
 
-// Firebase Identity Toolkit's accounts:createAuthUri endpoint reports whether
-// an email is already registered, using only the public API key (no admin
-// credentials needed) — the standard existence check.
+// Checks Firebase Auth directly via the Admin SDK's getUserByEmail().
+//
+// FIX (2026-09-14): this used to call the public accounts:createAuthUri REST
+// endpoint, which is how you check email existence WITHOUT admin credentials
+// — except this Firebase project has Email Enumeration Protection enabled,
+// which makes that endpoint (and signInWithPassword) return the identical
+// response for an existing and a nonexistent email. That made this check a
+// permanent no-op: it always reported "not registered", so an orphaned
+// Firebase-only account (created but never linked into Supabase — e.g. the
+// browser closed between account creation and the link-created call) stayed
+// invisible forever, and generateStudentLoginId() kept handing out that same
+// poisoned candidate on every retry, failing with auth/email-already-in-use
+// every time. getUserByEmail() via the Admin SDK isn't subject to enumeration
+// protection (it's a privileged server-side call), so it actually works.
+const firebaseAdmin = require('../services/firebaseAdmin');
 async function firebaseEmailExists(email) {
-  const apiKey = process.env.FIREBASE_API_KEY;
-  if (!apiKey) return false; // can't check without a key — don't block account creation on it
+  if (!firebaseAdmin) return false; // no service account configured — don't block account creation on it
   try {
-    const res = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:createAuthUri?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identifier: email, continueUri: 'https://aivorah.ai' }),
-      }
-    );
-    const data = await res.json();
-    return Boolean(data.registered);
-  } catch {
-    return false; // network hiccup — don't block on a check we can't complete
+    await firebaseAdmin.auth().getUserByEmail(email);
+    return true;
+  } catch (err) {
+    if (err?.code === 'auth/user-not-found') return false;
+    return false; // any other error (network, etc.) — don't block on a check we can't complete
   }
 }
 

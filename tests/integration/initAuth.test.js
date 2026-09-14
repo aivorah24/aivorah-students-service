@@ -2,12 +2,15 @@ const { makeSupabaseMock } = require('../helpers/supabaseMock');
 const mockSb = makeSupabaseMock();
 jest.mock('../../services/supabase', () => mockSb.supabase);
 
+const mockGetUserByEmail = jest.fn();
+jest.mock('../../services/firebaseAdmin', () => ({ auth: () => ({ getUserByEmail: mockGetUserByEmail }) }));
+
 const request = require('supertest');
 const app = require('../../index');
 
 beforeEach(() => {
   mockSb.reset();
-  global.fetch = jest.fn();
+  mockGetUserByEmail.mockReset();
 });
 
 describe('POST /teacher/students/init-auth', () => {
@@ -22,7 +25,7 @@ describe('POST /teacher/students/init-auth', () => {
     expect(res.status).toBe(200);
     expect(res.body.email).toBe('aarav@real.com');
     expect(res.body.emailProvided).toBe(true);
-    expect(global.fetch).not.toHaveBeenCalled();
+    expect(mockGetUserByEmail).not.toHaveBeenCalled();
   });
 
   test('rejects a duplicate email with 409', async () => {
@@ -47,18 +50,30 @@ describe('POST /teacher/students/init-auth', () => {
       { data: null, error: null },        // s3 free in Supabase
       { data: null, error: null },        // final duplicate check for chosen candidate (s3)
     ]);
-    global.fetch.mockImplementation((url) => {
-      if (String(url).includes('createAuthUri')) {
-        // Called once per Supabase-free candidate: s2 -> registered, s3 -> not registered
-        const callsSoFar = global.fetch.mock.calls.filter(c => String(c[0]).includes('createAuthUri')).length;
-        return Promise.resolve({ json: () => Promise.resolve({ registered: callsSoFar === 1 }) });
-      }
-      return Promise.resolve({ json: () => Promise.resolve({}) });
+    mockGetUserByEmail.mockImplementation((email) => {
+      if (email === 's2@aivorah.student') return Promise.resolve({ uid: 'orphaned-firebase-user' });
+      const err = new Error('no user'); err.code = 'auth/user-not-found';
+      return Promise.reject(err);
     });
 
     const res = await request(app).post('/teacher/students/init-auth').send({ name: 'No Email Kid' });
     expect(res.status).toBe(200);
     expect(res.body.email).toBe('s3@aivorah.student');
     expect(res.body.emailProvided).toBe(false);
+  });
+
+  test('falls back to Supabase-only when no Firebase Admin credential is configured (firebaseAdmin is null)', async () => {
+    jest.resetModules();
+    jest.doMock('../../services/supabase', () => mockSb.supabase);
+    jest.doMock('../../services/firebaseAdmin', () => null);
+    mockSb.setTable('users', [
+      { data: null, error: null }, // s1 free in Supabase
+      { data: null, error: null }, // final duplicate check
+    ]);
+    const freshApp = require('../../index');
+    const res = await request(freshApp).post('/teacher/students/init-auth').send({ name: 'No Admin Kid' });
+    expect(res.status).toBe(200);
+    expect(res.body.email).toBe('s1@aivorah.student');
+    jest.dontMock('../../services/firebaseAdmin');
   });
 });

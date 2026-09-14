@@ -309,4 +309,48 @@ async function sendEmailOtpCode({ to, otp, name }) {
   });
 }
 
-module.exports = { sendCredentialsEmail, sendBulkCredentialsEmail, sendOwnAccountCredentialsEmail, sendEmailOtpCode };
+// Ported from ai-mentor/server/services/mailer.js - used by routes/parent.js's
+// child password-reset route.
+async function sendPasswordResetEmail({ to, resetLink, childName }) {
+  if (!to || !resetLink) return;
+  const isChildReset = !!childName;
+  const subject = isChildReset ? `Reset ${childName}'s Aivorah password` : 'Reset your Aivorah password';
+  const bodyText = isChildReset
+    ? `You requested a password reset for your child <strong>${childName}</strong>'s Aivorah account. Click the button below to set a new password.`
+    : `We received a request to reset the password for your Aivorah account (<strong>${to}</strong>). Click the button below to set a new password.`;
+  try {
+    await sendEmail({
+      to,
+      subject,
+      html: `
+        <div style="font-family:sans-serif;max-width:500px;margin:0 auto;padding:24px;background:#fff">
+          <div style="background:#7C3AED;border-radius:12px;padding:24px 24px 16px;margin-bottom:24px">
+            <h1 style="margin:0;color:#fff;font-size:22px;font-weight:700">Aivorah</h1>
+            <p style="margin:8px 0 0;color:#e9d5ff;font-size:14px">Password Reset</p>
+          </div>
+
+          <p style="font-size:15px;color:#333;margin-bottom:4px">Hello,</p>
+          <p style="font-size:14px;color:#555;line-height:1.6">${bodyText}</p>
+
+          <div style="text-align:center;margin:32px 0">
+            <a href="${resetLink}" style="background:#7C3AED;color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-size:15px;font-weight:700;display:inline-block">
+              Reset Password
+            </a>
+          </div>
+
+          <p style="font-size:13px;color:#666;line-height:1.6">
+            This link will expire in 1 hour. If you didn't request this, you can safely ignore this email.
+          </p>
+
+          <p style="font-size:12px;color:#aaa;margin-top:32px;border-top:1px solid #eee;padding-top:16px">
+            Aivorah · Hyderabad, India
+          </p>
+        </div>
+      `,
+    });
+  } catch (err) {
+    console.warn('[mailer] sendPasswordResetEmail failed:', err.message);
+  }
+}
+
+module.exports = { sendCredentialsEmail, sendBulkCredentialsEmail, sendOwnAccountCredentialsEmail, sendEmailOtpCode, sendPasswordResetEmail };

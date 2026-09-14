@@ -5,8 +5,9 @@ const Groq     = require('groq-sdk');
 const { randomUUID } = require('crypto');
 const { computeLearningProfile, humanizeTopic, sanitizeReport } = require('../services/learningProfile');
 const { generateSecurePassword, toTitleCase } = require('../services/studentAccounts');
-const { sendCredentialsEmail, sendEmailOtpCode } = require('../services/mailer');
+const { sendCredentialsEmail, sendEmailOtpCode, sendPasswordResetEmail } = require('../services/mailer');
 const otpStore = require('../services/otpStore');
+const firebaseAdmin = require('../services/firebaseAdmin');
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
@@ -609,6 +610,290 @@ router.post('/children/email-otp/verify', async (req, res) => {
   } catch (err) {
     console.error('[parent/children/email-otp/verify]', err.message);
     res.status(500).json({ error: 'Verification failed. Please try again.' });
+  }
+});
+
+// ── GET /parent/:parentEmail/children/:childId/credentials ──
+// Returns the stored login ID / initial password for the parent to re-view.
+// Ported verbatim from ai-mentor/server/routes/parent.js as part of moving
+// the My Kids feature off the monolith - see init-auth's comment above.
+router.get('/:parentEmail/children/:childId/credentials', async (req, res) => {
+  try {
+    const { parentEmail, childId } = req.params;
+
+    const { data: link } = await supabase
+      .from('parent_children')
+      .select('child_id')
+      .eq('parent_email', parentEmail.toLowerCase())
+      .eq('child_id', childId)
+      .maybeSingle();
+    if (!link) return res.status(403).json({ error: 'Not authorised.' });
+
+    const { data: child } = await supabase
+      .from('users')
+      .select('email, name')
+      .eq('id', childId)
+      .maybeSingle();
+    if (!child) return res.status(404).json({ error: 'Child not found.' });
+
+    const { data: pref } = await supabase
+      .from('user_preferences')
+      .select('data')
+      .eq('user_email', child.email)
+      .maybeSingle();
+
+    const meta = pref?.data || {};
+
+    res.json({
+      loginId: child.email,
+      studentId: meta.studentId || null,
+      initialPassword: meta.initialPassword || null,
+      passwordSavedAt: meta.passwordSavedAt || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /parent/:parentEmail/children/:childId/resend-credentials ──
+router.post('/:parentEmail/children/:childId/resend-credentials', async (req, res) => {
+  try {
+    const { parentEmail, childId } = req.params;
+
+    const { data: link } = await supabase
+      .from('parent_children')
+      .select('child_id')
+      .eq('parent_email', parentEmail.toLowerCase())
+      .eq('child_id', childId)
+      .maybeSingle();
+    if (!link) return res.status(403).json({ error: 'Not authorised.' });
+
+    const { data: child } = await supabase
+      .from('users')
+      .select('email, name')
+      .eq('id', childId)
+      .maybeSingle();
+    if (!child) return res.status(404).json({ error: 'Child not found.' });
+
+    const { data: pref } = await supabase
+      .from('user_preferences')
+      .select('data')
+      .eq('user_email', child.email)
+      .maybeSingle();
+
+    const meta = pref?.data || {};
+    if (!meta.initialPassword) {
+      return res.status(400).json({ error: 'No saved credentials found for this account.' });
+    }
+
+    await sendCredentialsEmail({
+      to: parentEmail,
+      childName: child.name,
+      loginId: child.email,
+      password: meta.initialPassword,
+      studentId: meta.studentId || null,
+      childEmail: child.email,
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /parent/:parentEmail/children/:childId/reset-password ──
+// Generates a Firebase password reset link for the child via the Admin SDK,
+// rewrites it to our own themed /reset-password page, and emails it to the
+// parent. Clears the stored plaintext password since we no longer know it
+// once the new one is set through that page.
+router.post('/:parentEmail/children/:childId/reset-password', async (req, res) => {
+  try {
+    const { parentEmail, childId } = req.params;
+    const { frontendOrigin } = req.body || {};
+    const appBase = frontendOrigin || 'https://aivorah.ai';
+
+    const { data: link } = await supabase
+      .from('parent_children')
+      .select('child_id')
+      .eq('parent_email', parentEmail.toLowerCase())
+      .eq('child_id', childId)
+      .maybeSingle();
+    if (!link) return res.status(403).json({ error: 'Not authorised.' });
+
+    const { data: child } = await supabase
+      .from('users')
+      .select('email, name')
+      .eq('id', childId)
+      .maybeSingle();
+    if (!child) return res.status(404).json({ error: 'Child not found.' });
+
+    if (!firebaseAdmin) {
+      return res.status(500).json({ error: 'Password reset is not configured on the server.' });
+    }
+
+    let resetLink = null;
+    try {
+      resetLink = await firebaseAdmin.auth().generatePasswordResetLink(child.email, {
+        url: `${appBase}/reset-password`,
+        handleCodeInApp: false,
+      });
+    } catch (fbErr) {
+      console.error('[reset-child-password] generatePasswordResetLink failed:', fbErr.message);
+    }
+    if (!resetLink) {
+      return res.status(500).json({ error: 'Could not generate reset link. Please try again.' });
+    }
+
+    let themedLink = resetLink;
+    try {
+      const oob = new URL(resetLink).searchParams.get('oobCode');
+      if (oob) themedLink = `${appBase}/reset-password?oobCode=${encodeURIComponent(oob)}`;
+    } catch (_) { /* keep original link if parsing fails */ }
+
+    const { data: pref } = await supabase
+      .from('user_preferences')
+      .select('data')
+      .eq('user_email', child.email.toLowerCase())
+      .maybeSingle();
+    const currentData = pref?.data || {};
+    if (currentData.initialPassword) {
+      const { initialPassword, passwordSavedAt, ...rest } = currentData;
+      await supabase.from('user_preferences').upsert({
+        user_email: child.email.toLowerCase(),
+        data: rest,
+      }, { onConflict: 'user_email' });
+    }
+
+    await sendPasswordResetEmail({ to: parentEmail.toLowerCase(), resetLink: themedLink, childName: child.name });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[reset-child-password]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PATCH /parent/:parentEmail/children/:childId ─────────
+// Edit a child's name, email, grade, curriculum, school
+router.patch('/:parentEmail/children/:childId', async (req, res) => {
+  try {
+    const { parentEmail, childId } = req.params;
+    const { name, email, grade, curriculum, school, otpVerified = false } = req.body;
+
+    const { data: link } = await supabase
+      .from('parent_children')
+      .select('child_id')
+      .eq('parent_email', parentEmail.toLowerCase())
+      .eq('child_id', childId)
+      .maybeSingle();
+    if (!link) return res.status(403).json({ error: 'Not authorised to edit this child.' });
+
+    const { data: childUser } = await supabase
+      .from('users')
+      .select('id, name, email, grade, curriculum, school')
+      .eq('id', childId)
+      .single();
+    if (!childUser) return res.status(404).json({ error: 'Child user not found.' });
+
+    const patch = {};
+    if (name)       patch.name       = name.trim();
+    if (grade)      patch.grade      = grade;
+    if (curriculum) patch.curriculum = curriculum;
+    if (school !== undefined) patch.school = school;
+
+    let emailChanged = false;
+    let cleanEmail = '';
+    if (email && email.trim().toLowerCase() !== childUser.email.toLowerCase()) {
+      cleanEmail = email.trim().toLowerCase();
+      emailChanged = true;
+
+      const { data: existingUser } = await supabase
+        .from('users')
+        .select('id')
+        .eq('email', cleanEmail)
+        .maybeSingle();
+      if (existingUser && existingUser.id !== childId) {
+        return res.status(409).json({ error: 'This email is already in use by another account.' });
+      }
+    }
+
+    if (emailChanged) {
+      if (firebaseAdmin) {
+        const { data: pref } = await supabase
+          .from('user_preferences')
+          .select('data')
+          .eq('user_email', childUser.email.toLowerCase())
+          .maybeSingle();
+        const firebaseUid = pref?.data?.firebaseUid;
+        try {
+          if (firebaseUid) {
+            await firebaseAdmin.auth().updateUser(firebaseUid, { email: cleanEmail });
+          } else {
+            const firebaseUser = await firebaseAdmin.auth().getUserByEmail(childUser.email);
+            await firebaseAdmin.auth().updateUser(firebaseUser.uid, { email: cleanEmail });
+          }
+        } catch (firebaseErr) {
+          console.warn('[PATCH /children/:childId] Firebase Auth email update failed/skipped:', firebaseErr.message);
+        }
+      }
+
+      await supabase
+        .from('user_preferences')
+        .update({ user_email: cleanEmail })
+        .eq('user_email', childUser.email.toLowerCase());
+
+      if (!cleanEmail.endsWith('@aivorah.student')) {
+        const { data: existingPref } = await supabase
+          .from('user_preferences').select('data').eq('user_email', cleanEmail).maybeSingle();
+        const currentData = existingPref?.data || {};
+        await supabase.from('user_preferences').upsert({
+          user_email: cleanEmail,
+          data: { ...currentData, accountStatus: 'active' },
+        }, { onConflict: 'user_email' });
+
+        if (currentData.initialPassword) {
+          sendCredentialsEmail({
+            to: cleanEmail,
+            childName: (name || childUser.name).trim(),
+            loginId: cleanEmail,
+            password: currentData.initialPassword,
+            studentId: currentData.studentId,
+          }).catch(() => {});
+        }
+      }
+      patch.onboarding_complete = true;
+      patch.email = cleanEmail;
+    }
+
+    const { data, error } = await supabase
+      .from('users')
+      .update(patch)
+      .eq('id', childId)
+      .select('id, name, email, grade, curriculum, school')
+      .single();
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true, child: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /parent/:parentEmail/children/:childId ────────
+// Unlink a child from a parent (does not delete the child's own account/data)
+router.delete('/:parentEmail/children/:childId', async (req, res) => {
+  try {
+    const { parentEmail, childId } = req.params;
+
+    const { error } = await supabase
+      .from('parent_children')
+      .delete()
+      .eq('parent_email', parentEmail)
+      .eq('child_id', childId);
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 

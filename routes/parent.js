@@ -13,19 +13,44 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // Same @aivorah.student login-ID scheme the monolith used, kept identical so
 // existing accounts created there stay consistent with new ones created here.
+//
+// FIX (2026-09-14): this only checked Supabase for collisions, same class of
+// bug already found and fixed in routes/teacher.js's generateStudentLoginId
+// (see that function's comment for the full story - Firebase's own existence
+// check silently stopped working project-wide once Email Enumeration
+// Protection was enabled, and this function never had ANY Firebase check to
+// begin with). Result: if a child's Firebase Auth account was ever created
+// but the Supabase write didn't complete, that candidate stayed "free" in
+// Supabase forever and every future Create New Student attempt for that
+// parent kept landing on it, failing with auth/email-already-in-use every
+// time. Now checks Firebase via the Admin SDK too, same as the teacher path.
+async function firebaseEmailExists(email) {
+  if (!firebaseAdmin) return false;
+  try {
+    await firebaseAdmin.auth().getUserByEmail(email);
+    return true;
+  } catch (err) {
+    if (err?.code === 'auth/user-not-found') return false;
+    return false;
+  }
+}
 async function generateChildLoginId(parentEmail) {
   if (parentEmail) {
     const localPart = parentEmail.split('@')[0].toLowerCase().trim().replace(/[^a-z0-9]/g, '');
     for (let n = 1; n < 100; n++) {
       const candidate = `${localPart}_ch${n}@aivorah.student`;
       const { data: existing } = await supabase.from('users').select('id').eq('email', candidate).maybeSingle();
-      if (!existing) return candidate;
+      if (existing) continue;
+      if (await firebaseEmailExists(candidate)) continue;
+      return candidate;
     }
   }
   for (let n = 1; n < 100000; n++) {
     const candidate = `ch${n}@aivorah.student`;
     const { data: existing } = await supabase.from('users').select('id').eq('email', candidate).maybeSingle();
-    if (!existing) return candidate;
+    if (existing) continue;
+    if (await firebaseEmailExists(candidate)) continue;
+    return candidate;
   }
   return `ch${Date.now()}@aivorah.student`;
 }

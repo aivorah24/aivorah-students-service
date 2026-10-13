@@ -180,7 +180,7 @@ async function sendBulkCredentialsEmail({ to, created }) {
 
     const csvLines = [
       'Name,Role,Login Email,Password,Grade,Curriculum',
-      ...created.map(r => [r.name, roleLabel(r.role), r.email, r.password, r.grade, r.curriculum].map(esc).join(',')),
+      ...created.map(r => [r.name, roleLabel(r.role), r.email, r.password || 'Invite emailed', r.grade, r.curriculum].map(esc).join(',')),
     ];
     const csvContent = csvLines.join('\n');
 
@@ -191,7 +191,7 @@ async function sendBulkCredentialsEmail({ to, created }) {
             <td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:13px;word-break:break-word">${r.name}</td>
             <td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:12px;color:${r.role === 'parent' ? '#7C3AED' : '#0f766e'};font-weight:700">${roleLabel(r.role)}</td>
             <td style="padding:6px 8px;border-bottom:1px solid #eee;font-family:monospace;font-size:11px;word-break:break-all">${r.email}</td>
-            <td style="padding:6px 8px;border-bottom:1px solid #eee;font-family:monospace;font-size:11px;word-break:break-all">${r.password}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #eee;font-family:monospace;font-size:11px;word-break:break-all">${r.password || 'Invite emailed'}</td>
           </tr>`).join('');
 
     await sendEmail({
@@ -353,4 +353,21 @@ async function sendPasswordResetEmail({ to, resetLink, childName }) {
   }
 }
 
-module.exports = { sendCredentialsEmail, sendBulkCredentialsEmail, sendOwnAccountCredentialsEmail, sendEmailOtpCode, sendPasswordResetEmail };
+// Set-password invite for a teacher-created student with a real email — same
+// wording as platform-admin's Add user invite. Throws so the caller can report it.
+async function sendStudentInviteEmail({ to, name, link }) {
+  const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  await sendEmail({
+    to,
+    subject: "You've been invited to Aivorah as a Student",
+    html: `<div style="font-family:Inter,Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#0B0B0B">
+  <h2 style="margin:0 0 12px">Welcome to Aivorah</h2>
+  <p>Hi ${esc(name)},</p>
+  <p>Your teacher has created a <strong>Student</strong> account for you. To get started, set your password using the button below.</p>
+  <p style="margin:24px 0"><a href="${link}" style="background:#9A7B2E;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:700">Set your password</a></p>
+  <p>You'll also need to verify your email address before you can use Aivorah — we've sent a separate verification email for this.</p>
+</div>`,
+  });
+}
+
+module.exports = { sendCredentialsEmail, sendBulkCredentialsEmail, sendOwnAccountCredentialsEmail, sendEmailOtpCode, sendPasswordResetEmail, sendStudentInviteEmail };

@@ -17,9 +17,9 @@ function calls(table, method) {
 describe('"NCERT" is stored and returned as CBSE', () => {
   test('teacher link-created with curriculum NCERT writes CBSE', async () => {
     mockSb.setTable('users', [
+      { data: { id: 'teacher-uuid', school: 'TSRA', school_id: null }, error: null },
       { data: null, error: null },
       { data: null, error: null },
-      { data: { id: 'teacher-uuid' }, error: null },
     ]);
     const res = await request(app).post('/teacher/t@school.com/students/link-created').send({
       firebaseUid: 'fb-1', name: 'Ravi', email: 'ravi@real.com', grade: 'Grade 8', curriculum: 'NCERT',

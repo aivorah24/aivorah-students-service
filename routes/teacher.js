@@ -4,6 +4,7 @@ const supabase = require('../services/supabase');
 const { randomUUID, randomInt } = require('crypto');
 const { sendCredentialsEmail, sendBulkCredentialsEmail, sendOwnAccountCredentialsEmail } = require('../services/mailer');
 const { generateParentLoginId } = require('../services/studentAccounts');
+const { normalizeCurriculum } = require('../services/curriculum');
 const multer   = require('multer');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
@@ -113,7 +114,8 @@ router.post('/students/init-auth', async (req, res) => {
 router.post('/:teacherEmail/students/link-created', async (req, res) => {
   try {
     const { teacherEmail } = req.params;
-    const { firebaseUid, name, email, grade, curriculum, school = '', studentId, initialPassword } = req.body || {};
+    const { firebaseUid, name, email, grade, curriculum: rawCurriculum, school = '', studentId, initialPassword } = req.body || {};
+    const curriculum = normalizeCurriculum(rawCurriculum);
 
     if (!firebaseUid || !name || !email || !grade || !curriculum) {
       return res.status(400).json({ error: 'firebaseUid, name, email, grade, curriculum are required' });
@@ -308,7 +310,7 @@ router.post('/:teacherEmail/students/link-existing', async (req, res) => {
     const { error } = await supabase.from('teacher_student').upsert({
       teacher_id: teacher.id,
       student_id: student.id,
-      subject: student.curriculum || 'General',
+      subject: normalizeCurriculum(student.curriculum) || 'General',
     }, { onConflict: 'teacher_id,student_id,subject', ignoreDuplicates: true });
     if (error) return res.status(500).json({ error: error.message });
 
@@ -411,7 +413,7 @@ async function buildTeacherTemplateRows(cleanTeacherEmail) {
     .from('user_preferences').select('data').eq('user_email', cleanTeacherEmail).maybeSingle();
   const teaches = teacherPrefs?.data?.teaches || [];
   const defaultGrade = teaches[0]?.grade || 'Grade 3';
-  const defaultCurriculum = teaches[0]?.curriculum || 'IB PYP';
+  const defaultCurriculum = normalizeCurriculum(teaches[0]?.curriculum || 'IB PYP');
 
   const sampleRows = teacherSampleRows(defaultGrade, defaultCurriculum, teacher.school);
 
@@ -440,7 +442,7 @@ async function buildTeacherTemplateRows(cleanTeacherEmail) {
     const pEmail = parentEmailByChild.get(s.id) || '';
     const parent = pEmail ? parentByEmail.get(pEmail) : null;
     return [
-      s.name || '', s.email || '', s.grade || '', s.section || '', s.curriculum || '', s.school || '',
+      s.name || '', s.email || '', s.grade || '', s.section || '', normalizeCurriculum(s.curriculum) || '', s.school || '',
       parent?.name || '', parent?.email || pEmail || '', parent?.phone || '',
     ];
   });
@@ -551,7 +553,7 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
   try {
     const { teacherEmail } = req.params;
     const defaultGrade      = (req.body?.defaultGrade      || 'Grade 3').trim();
-    const defaultCurriculum = (req.body?.defaultCurriculum || 'IB PYP').trim();
+    const defaultCurriculum = normalizeCurriculum(req.body?.defaultCurriculum || 'IB PYP');
     const previewOnly = req.body?.previewOnly === 'true' || req.body?.previewOnly === true;
 
     if (!req.file) return res.status(400).json({ error: 'No CSV file uploaded.' });
@@ -566,7 +568,7 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
     const { data: teacherPrefs } = await supabase
       .from('user_preferences').select('data').eq('user_email', cleanTeacherEmail).maybeSingle();
     const teacherTeaches = teacherPrefs?.data?.teaches || [];
-    const normKey = (g, c) => `${String(g || '').trim().toLowerCase()}|${String(c || '').trim().toLowerCase()}`;
+    const normKey = (g, c) => `${String(g || '').trim().toLowerCase()}|${String(normalizeCurriculum(c) || '').toLowerCase()}`;
     const teacherGradeCurriculumSet = new Set(teacherTeaches.map(t => normKey(t.grade, t.curriculum)));
 
     // Which exact rows (by 1-based position in the parsed file) the teacher
@@ -615,7 +617,7 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
       const emailRaw     = emailIdx >= 0 ? (row[emailIdx]?.trim() || '') : '';
       const grade        = gradeIdx >= 0 && row[gradeIdx]?.trim() ? row[gradeIdx].trim() : defaultGrade;
       const section      = sectionIdx >= 0 ? (row[sectionIdx]?.trim() || '') : '';
-      const curriculum   = curriculumIdx >= 0 && row[curriculumIdx]?.trim() ? row[curriculumIdx].trim() : defaultCurriculum;
+      const curriculum   = curriculumIdx >= 0 && row[curriculumIdx]?.trim() ? normalizeCurriculum(row[curriculumIdx]) : defaultCurriculum;
       const school       = schoolIdx >= 0 ? (row[schoolIdx]?.trim() || '') : '';
       const parentName   = parentNameIdx  >= 0 ? (row[parentNameIdx]?.trim() || '')  : '';
       const parentEmailIn = parentEmailIdx >= 0 ? (row[parentEmailIdx]?.trim().toLowerCase() || '') : '';

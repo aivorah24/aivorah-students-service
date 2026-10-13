@@ -6,6 +6,7 @@ const { sendCredentialsEmail, sendBulkCredentialsEmail, sendOwnAccountCredential
 const { generateParentLoginId } = require('../services/studentAccounts');
 const { getTeacherSchool, resolveCurriculum } = require('../services/teacherSchool');
 const { isRealEmail, createInvitedFirebaseUser, sendInviteAndVerification } = require('../services/studentInvite');
+const { normalizeCurriculum } = require('../services/curriculum');
 const multer   = require('multer');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
@@ -131,7 +132,7 @@ router.post('/:teacherEmail/students/link-created', async (req, res) => {
     const ctx = await getTeacherSchool(cleanTeacherEmail);
     if (!ctx) return res.status(404).json({ error: 'Teacher account not found.' });
     const { teacher, school, schoolId } = ctx;
-    const curriculum = resolveCurriculum(ctx.curriculum, grade) || req.body.curriculum;
+    const curriculum = normalizeCurriculum(resolveCurriculum(ctx.curriculum, grade) || req.body.curriculum);
 
     // 1. Upsert student in users table
     const { data: existingUser } = await supabase.from('users').select('id').eq('email', cleanEmail).maybeSingle();
@@ -237,7 +238,7 @@ router.post('/:teacherEmail/students/invite', async (req, res) => {
     const ctx = await getTeacherSchool(cleanTeacherEmail);
     if (!ctx) return res.status(404).json({ error: 'Teacher account not found.' });
     const { teacher, school, schoolId } = ctx;
-    const curriculum = resolveCurriculum(ctx.curriculum, grade) || req.body.curriculum;
+    const curriculum = normalizeCurriculum(resolveCurriculum(ctx.curriculum, grade) || req.body.curriculum);
 
     const { data: existing } = await supabase.from('users').select('id').eq('email', cleanEmail).maybeSingle();
     if (existing) return res.status(409).json({ error: 'An account with this email already exists.' });
@@ -388,7 +389,7 @@ router.post('/:teacherEmail/students/link-existing', async (req, res) => {
     const { error } = await supabase.from('teacher_student').upsert({
       teacher_id: teacher.id,
       student_id: student.id,
-      subject: student.curriculum || 'General',
+      subject: normalizeCurriculum(student.curriculum) || 'General',
     }, { onConflict: 'teacher_id,student_id,subject', ignoreDuplicates: true });
     if (error) return res.status(500).json({ error: error.message });
 
@@ -490,7 +491,7 @@ async function buildTeacherTemplateRows(cleanTeacherEmail) {
     .from('user_preferences').select('data').eq('user_email', cleanTeacherEmail).maybeSingle();
   const teaches = teacherPrefs?.data?.teaches || [];
   const defaultGrade = teaches[0]?.grade || 'Grade 3';
-  const defaultCurriculum = resolveCurriculum(ctx.curriculum, defaultGrade) || teaches[0]?.curriculum || 'IB PYP';
+  const defaultCurriculum = normalizeCurriculum(resolveCurriculum(ctx.curriculum, defaultGrade) || teaches[0]?.curriculum || 'IB PYP');
   return { rows: teacherSampleRows(defaultGrade, defaultCurriculum, ctx.school) };
 }
 
@@ -597,7 +598,7 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
   try {
     const { teacherEmail } = req.params;
     const defaultGrade      = (req.body?.defaultGrade      || 'Grade 3').trim();
-    const defaultCurriculum = (req.body?.defaultCurriculum || 'IB PYP').trim();
+    const defaultCurriculum = normalizeCurriculum(req.body?.defaultCurriculum || 'IB PYP');
     const previewOnly = req.body?.previewOnly === 'true' || req.body?.previewOnly === true;
 
     if (!req.file) return res.status(400).json({ error: 'No CSV file uploaded.' });
@@ -614,7 +615,7 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
     const { data: teacherPrefs } = await supabase
       .from('user_preferences').select('data').eq('user_email', cleanTeacherEmail).maybeSingle();
     const teacherTeaches = teacherPrefs?.data?.teaches || [];
-    const normKey = (g, c) => `${String(g || '').trim().toLowerCase()}|${String(c || '').trim().toLowerCase()}`;
+    const normKey = (g, c) => `${String(g || '').trim().toLowerCase()}|${String(normalizeCurriculum(c) || '').toLowerCase()}`;
     const teacherGradeCurriculumSet = new Set(teacherTeaches.map(t => normKey(t.grade, t.curriculum)));
 
     // Which exact rows (by 1-based position in the parsed file) the teacher
@@ -663,8 +664,8 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
       const emailRaw     = emailIdx >= 0 ? (row[emailIdx]?.trim() || '') : '';
       const grade        = gradeIdx >= 0 && row[gradeIdx]?.trim() ? row[gradeIdx].trim() : defaultGrade;
       const section      = sectionIdx >= 0 ? (row[sectionIdx]?.trim() || '') : '';
-      const curriculum   = resolveCurriculum(ctx.curriculum, grade)
-        || (curriculumIdx >= 0 && row[curriculumIdx]?.trim() ? row[curriculumIdx].trim() : defaultCurriculum);
+      const curriculum   = normalizeCurriculum(resolveCurriculum(ctx.curriculum, grade))
+        || (curriculumIdx >= 0 && row[curriculumIdx]?.trim() ? normalizeCurriculum(row[curriculumIdx]) : defaultCurriculum);
       const school       = schoolIdx >= 0 ? (row[schoolIdx]?.trim() || '') : '';
       const parentName   = parentNameIdx  >= 0 ? (row[parentNameIdx]?.trim() || '')  : '';
       const parentEmailIn = parentEmailIdx >= 0 ? (row[parentEmailIdx]?.trim().toLowerCase() || '') : '';

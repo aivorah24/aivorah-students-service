@@ -148,6 +148,20 @@ describe('GET /parent/:parentEmail/children', () => {
     expect(res.body[0]).toMatchObject({ grade: 'Grade 3', curriculum: 'IB PYP', profileGrade: '', profileCurriculum: '' });
   });
 
+  test('legacy NCERT on the users row -> profileCurriculum is CBSE', async () => {
+    mockSb.setTable('parent_children', {
+      data: [{ child_id: 'child-1', added_at: null, users: { id: 'child-1', name: 'Asha', email: 'asha@example.com', grade: 'Grade 8', curriculum: 'NCERT', school: '' } }],
+      error: null,
+    });
+    mockSb.setTable('student_stats', { data: [], error: null });
+    global.fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ totalTopics: 0 }) });
+
+    const res = await request(app).get('/parent/parent@example.com/children');
+
+    expect(res.status).toBe(200);
+    expect(res.body[0]).toMatchObject({ curriculum: 'CBSE', profileCurriculum: 'CBSE', profileGrade: 'Grade 8' });
+  });
+
   test('supabase error on the parent_children lookup -> 500', async () => {
     mockSb.setTable('parent_children', { data: null, error: { message: 'db down' } });
 

@@ -142,7 +142,7 @@ router.get('/:parentEmail/children', async (req, res) => {
         // Raw users-row values: grade/curriculum above default when unset, which would
         // show the wrong subject list in Parental Controls.
         profileGrade:      user.grade      || '',
-        profileCurriculum: user.curriculum || '',
+        profileCurriculum: normalizeCurriculum(user.curriculum || ''),
         school:           user.school     || '',
         totalTopics,
         xpPoints:         s.xp_points         ?? 0,

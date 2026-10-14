@@ -2,6 +2,7 @@ const express  = require('express');
 const router   = express.Router();
 const supabase = require('../services/supabase');
 const { normalizeGrade } = require('../services/gradeMatch');
+const { normalizeCurriculum, curriculumAliases } = require('../services/curriculum');
 
 // ── GET /student/available-to-link?teacherEmail=xxx ────────
 // Returns students NOT already linked to this teacher.
@@ -71,7 +72,7 @@ router.get('/available-to-link', async (req, res) => {
       // offered as a linkable "student" (confirmed live: happened for a
       // teacher whose own account had role 'parent').
 
-    if (teacher?.curriculum) query = query.eq('curriculum', teacher.curriculum);
+    if (teacher?.curriculum) query = query.in('curriculum', curriculumAliases(teacher.curriculum));
     // School scoping: a teacher can only link students from their OWN school —
     // same curriculum + grade but a different school must not appear here.
     if (teacher?.school) query = query.eq('school', teacher.school);
@@ -84,7 +85,7 @@ router.get('/available-to-link', async (req, res) => {
       // whitelist at both the DB and JS layer, so nothing slips through if the
       // Supabase query's own filter is ever bypassed or a caller mocks/stubs it.
       .filter(s => !linkedIds.includes(s.id) && s.name && s.role === 'student' && normalizedTargetGrades.has(normalizeGrade(s.grade)))
-      .map(s => ({ id: s.id, name: s.name, email: s.email, grade: s.grade, curriculum: s.curriculum, photoUrl: s.photo_url }));
+      .map(s => ({ id: s.id, name: s.name, email: s.email, grade: s.grade, curriculum: normalizeCurriculum(s.curriculum), photoUrl: s.photo_url }));
 
     res.json(available);
   } catch (err) {

@@ -4,6 +4,9 @@ const supabase = require('../services/supabase');
 const { randomUUID, randomInt } = require('crypto');
 const { sendCredentialsEmail, sendBulkCredentialsEmail, sendOwnAccountCredentialsEmail } = require('../services/mailer');
 const { generateParentLoginId } = require('../services/studentAccounts');
+const { getTeacherSchool, resolveCurriculum } = require('../services/teacherSchool');
+const { isRealEmail, createInvitedFirebaseUser, sendInviteAndVerification } = require('../services/studentInvite');
+const { normalizeCurriculum } = require('../services/curriculum');
 const multer   = require('multer');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
@@ -109,13 +112,15 @@ router.post('/students/init-auth', async (req, res) => {
 //   - save the student to the users table
 //   - link them to this teacher in teacher_student
 //   - store credentials in user_preferences
-// Body: { firebaseUid, name, email, grade, curriculum, school?, studentId?, initialPassword? }
+// Body: { firebaseUid, name, email, grade, curriculum, studentId?, initialPassword? }
+// School (name + school_id) always comes from the teacher; curriculum from the
+// school's board when it has one.
 router.post('/:teacherEmail/students/link-created', async (req, res) => {
   try {
     const { teacherEmail } = req.params;
-    const { firebaseUid, name, email, grade, curriculum, school = '', studentId, initialPassword } = req.body || {};
+    const { firebaseUid, name, email, grade, studentId, initialPassword } = req.body || {};
 
-    if (!firebaseUid || !name || !email || !grade || !curriculum) {
+    if (!firebaseUid || !name || !email || !grade || !req.body?.curriculum) {
       return res.status(400).json({ error: 'firebaseUid, name, email, grade, curriculum are required' });
     }
 
@@ -123,6 +128,11 @@ router.post('/:teacherEmail/students/link-created', async (req, res) => {
     const cleanTeacherEmail = String(teacherEmail).toLowerCase().trim();
     const resolvedStudentId = String(studentId || '').trim() || `STU-${Date.now()}`;
     const newId             = randomUUID();
+
+    const ctx = await getTeacherSchool(cleanTeacherEmail);
+    if (!ctx) return res.status(404).json({ error: 'Teacher account not found.' });
+    const { teacher, school, schoolId } = ctx;
+    const curriculum = normalizeCurriculum(resolveCurriculum(ctx.curriculum, grade) || req.body.curriculum);
 
     // 1. Upsert student in users table
     const { data: existingUser } = await supabase.from('users').select('id').eq('email', cleanEmail).maybeSingle();
@@ -135,7 +145,8 @@ router.post('/:teacherEmail/students/link-created', async (req, res) => {
       role: 'student',
       grade,
       curriculum,
-      school: String(school || '').trim(),
+      school,
+      school_id: schoolId,
       onboarding_complete: true,
     }, { onConflict: 'id' });
     if (userErr) return res.status(500).json({ error: userErr.message });
@@ -144,10 +155,7 @@ router.post('/:teacherEmail/students/link-created', async (req, res) => {
     await supabase.from('student_stats')
       .upsert({ student_id: userId }, { onConflict: 'student_id', ignoreDuplicates: true });
 
-    // 3. Find teacher and link
-    const { data: teacher } = await supabase.from('users').select('id').eq('email', cleanTeacherEmail).maybeSingle();
-    if (!teacher) return res.status(404).json({ error: 'Teacher account not found.' });
-
+    // 3. Link to the teacher
     await supabase.from('teacher_student').upsert({
       teacher_id: teacher.id,
       student_id: userId,
@@ -203,10 +211,83 @@ router.post('/:teacherEmail/students/link-created', async (req, res) => {
         email: cleanEmail,
         grade,
         curriculum,
-        school: String(school || '').trim(),
+        school,
+        schoolId,
       },
     });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /teacher/:teacherEmail/students/invite ───────────────────────────────
+// A student with a REAL email: same flow as platform-admin Add user — account
+// with a random password, set-password invite, auth-service verification. The
+// student can't use the app until they verify. Body: { name, email, grade, curriculum, frontendOrigin? }
+router.post('/:teacherEmail/students/invite', async (req, res) => {
+  try {
+    const { name, email, grade, frontendOrigin } = req.body || {};
+    const cleanName = toTitleCase(String(name || '').trim());
+    const cleanEmail = String(email || '').toLowerCase().trim();
+    const cleanTeacherEmail = String(req.params.teacherEmail).toLowerCase().trim();
+    if (!cleanName) return res.status(400).json({ error: 'Name is required.' });
+    if (!isRealEmail(cleanEmail)) return res.status(400).json({ error: 'Enter a valid email address.' });
+    if (!grade || !req.body?.curriculum) return res.status(400).json({ error: 'grade and curriculum are required' });
+    if (!firebaseAdmin) return res.status(500).json({ error: 'Auth is not configured on this server.' });
+
+    const ctx = await getTeacherSchool(cleanTeacherEmail);
+    if (!ctx) return res.status(404).json({ error: 'Teacher account not found.' });
+    const { teacher, school, schoolId } = ctx;
+    const curriculum = normalizeCurriculum(resolveCurriculum(ctx.curriculum, grade) || req.body.curriculum);
+
+    const { data: existing } = await supabase.from('users').select('id').eq('email', cleanEmail).maybeSingle();
+    if (existing) return res.status(409).json({ error: 'An account with this email already exists.' });
+    if (await firebaseEmailExists(cleanEmail)) {
+      return res.status(409).json({ error: 'This email is already registered — ask the student to sign in or reset their password.' });
+    }
+
+    let created;
+    try {
+      created = await createInvitedFirebaseUser(cleanEmail, cleanName);
+    } catch (err) {
+      if (err.code === 'auth/email-already-exists') {
+        return res.status(409).json({ error: 'This email is already registered — ask the student to sign in or reset their password.' });
+      }
+      throw err;
+    }
+
+    const userId = randomUUID();
+    const studentId = `STU-${Date.now()}`;
+    const { error: userErr } = await supabase.from('users').insert({
+      id: userId, name: cleanName, email: cleanEmail, role: 'student',
+      grade, curriculum, school, school_id: schoolId, onboarding_complete: true,
+    });
+    if (userErr) {
+      await firebaseAdmin.auth().deleteUser(created.uid).catch(() => {});
+      return res.status(500).json({ error: userErr.message });
+    }
+
+    await supabase.from('student_stats').upsert({ student_id: userId }, { onConflict: 'student_id', ignoreDuplicates: true });
+    await supabase.from('teacher_student').upsert({
+      teacher_id: teacher.id, student_id: userId, subject: curriculum,
+    }, { onConflict: 'teacher_id,student_id,subject', ignoreDuplicates: true });
+    await supabase.from('user_preferences').upsert({
+      user_email: cleanEmail,
+      data: {
+        studentId, createdByTeacher: cleanTeacherEmail, firebaseUid: created.uid,
+        accountStatus: 'pending_verification', invitedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      },
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'user_email' });
+
+    const sent = await sendInviteAndVerification({ email: cleanEmail, name: cleanName, frontendOrigin });
+    res.json({
+      success: true,
+      student: { id: userId, studentId, name: cleanName, email: cleanEmail, grade, curriculum, school, schoolId },
+      ...sent,
+    });
+  } catch (err) {
+    console.error('[POST /teacher/:teacherEmail/students/invite] error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -308,7 +389,7 @@ router.post('/:teacherEmail/students/link-existing', async (req, res) => {
     const { error } = await supabase.from('teacher_student').upsert({
       teacher_id: teacher.id,
       student_id: student.id,
-      subject: student.curriculum || 'General',
+      subject: normalizeCurriculum(student.curriculum) || 'General',
     }, { onConflict: 'teacher_id,student_id,subject', ignoreDuplicates: true });
     if (error) return res.status(500).json({ error: error.message });
 
@@ -378,10 +459,9 @@ async function createFirebaseAccount(email, password) {
 }
 
 // ── GET /teacher/:teacherEmail/students/template.csv|.xlsx ───────────────────
-// Download a pre-filled roster (this teacher's own students) to edit and
-// re-upload via POST /students/bulk-import. Mirrors the School Admin bulk
-// import template (branded header, borders, frozen row, sample rows
-// visually marked) so both flows look/feel consistent.
+// Blank import template: headers + 2 obviously fake sample rows. Never includes
+// real student/parent data. Mirrors the School Admin bulk import template
+// styling (branded header, borders, frozen row, sample rows visually marked).
 const TEACHER_TEMPLATE_HEADER = ['Name', 'Email', 'Grade', 'Section', 'Curriculum', 'School', 'Parent Name', 'Parent Email', 'Parent Phone'];
 const TEACHER_SAMPLE_ROW_COUNT = 2;
 
@@ -404,48 +484,15 @@ function teacherToCsv(header, rows) {
 }
 
 async function buildTeacherTemplateRows(cleanTeacherEmail) {
-  const { data: teacher } = await supabase.from('users').select('id, school').eq('email', cleanTeacherEmail).maybeSingle();
-  if (!teacher) return { rows: [], defaultGrade: 'Grade 3', defaultCurriculum: 'IB PYP', school: '' };
+  const ctx = await getTeacherSchool(cleanTeacherEmail);
+  if (!ctx) return { rows: teacherSampleRows('Grade 3', 'IB PYP', '') };
 
   const { data: teacherPrefs } = await supabase
     .from('user_preferences').select('data').eq('user_email', cleanTeacherEmail).maybeSingle();
   const teaches = teacherPrefs?.data?.teaches || [];
   const defaultGrade = teaches[0]?.grade || 'Grade 3';
-  const defaultCurriculum = teaches[0]?.curriculum || 'IB PYP';
-
-  const sampleRows = teacherSampleRows(defaultGrade, defaultCurriculum, teacher.school);
-
-  const { data: links } = await supabase.from('teacher_student').select('student_id').eq('teacher_id', teacher.id);
-  const studentIds = [...new Set((links || []).map(l => l.student_id))];
-  const { data: students } = studentIds.length
-    ? await supabase.from('users').select('id, name, email, grade, section, curriculum, school').in('id', studentIds).order('name')
-    : { data: [] };
-
-  // Pre-fill each student's linked parent (name/email/phone) so the roster
-  // download doubles as an editable export — same as the School Admin template.
-  const { data: parentLinks } = studentIds.length
-    ? await supabase.from('parent_children').select('parent_email, child_id').in('child_id', studentIds)
-    : { data: [] };
-  const parentEmailByChild = new Map();
-  for (const l of parentLinks || []) {
-    if (!parentEmailByChild.has(l.child_id)) parentEmailByChild.set(l.child_id, l.parent_email);
-  }
-  const parentEmails = [...new Set([...parentEmailByChild.values()].filter(Boolean))];
-  const { data: parents } = parentEmails.length
-    ? await supabase.from('users').select('name, email, phone').in('email', parentEmails)
-    : { data: [] };
-  const parentByEmail = new Map((parents || []).map(p => [p.email, p]));
-
-  const realRows = (students || []).map(s => {
-    const pEmail = parentEmailByChild.get(s.id) || '';
-    const parent = pEmail ? parentByEmail.get(pEmail) : null;
-    return [
-      s.name || '', s.email || '', s.grade || '', s.section || '', s.curriculum || '', s.school || '',
-      parent?.name || '', parent?.email || pEmail || '', parent?.phone || '',
-    ];
-  });
-
-  return { rows: [...sampleRows, ...realRows], defaultGrade, defaultCurriculum, school: teacher.school || '' };
+  const defaultCurriculum = normalizeCurriculum(resolveCurriculum(ctx.curriculum, defaultGrade) || teaches[0]?.curriculum || 'IB PYP');
+  return { rows: teacherSampleRows(defaultGrade, defaultCurriculum, ctx.school) };
 }
 
 router.get('/:teacherEmail/students/template.csv', async (req, res) => {
@@ -551,14 +598,16 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
   try {
     const { teacherEmail } = req.params;
     const defaultGrade      = (req.body?.defaultGrade      || 'Grade 3').trim();
-    const defaultCurriculum = (req.body?.defaultCurriculum || 'IB PYP').trim();
+    const defaultCurriculum = normalizeCurriculum(req.body?.defaultCurriculum || 'IB PYP');
     const previewOnly = req.body?.previewOnly === 'true' || req.body?.previewOnly === true;
 
     if (!req.file) return res.status(400).json({ error: 'No CSV file uploaded.' });
 
     const cleanTeacherEmail = String(teacherEmail).toLowerCase().trim();
-    const { data: teacher } = await supabase.from('users').select('id, school').eq('email', cleanTeacherEmail).maybeSingle();
-    if (!teacher) return res.status(404).json({ error: 'Teacher account not found.' });
+    const ctx = await getTeacherSchool(cleanTeacherEmail);
+    if (!ctx) return res.status(404).json({ error: 'Teacher account not found.' });
+    // Every student joins the teacher's own school; the row's School column is only checked.
+    const teacher = { ...ctx.teacher, school: ctx.school };
 
     // Which grade+curriculum combos this teacher actually handles (Staff Subject
     // Mapping) — a CSV row outside this set is flagged for the teacher to
@@ -566,7 +615,7 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
     const { data: teacherPrefs } = await supabase
       .from('user_preferences').select('data').eq('user_email', cleanTeacherEmail).maybeSingle();
     const teacherTeaches = teacherPrefs?.data?.teaches || [];
-    const normKey = (g, c) => `${String(g || '').trim().toLowerCase()}|${String(c || '').trim().toLowerCase()}`;
+    const normKey = (g, c) => `${String(g || '').trim().toLowerCase()}|${String(normalizeCurriculum(c) || '').toLowerCase()}`;
     const teacherGradeCurriculumSet = new Set(teacherTeaches.map(t => normKey(t.grade, t.curriculum)));
 
     // Which exact rows (by 1-based position in the parsed file) the teacher
@@ -615,7 +664,8 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
       const emailRaw     = emailIdx >= 0 ? (row[emailIdx]?.trim() || '') : '';
       const grade        = gradeIdx >= 0 && row[gradeIdx]?.trim() ? row[gradeIdx].trim() : defaultGrade;
       const section      = sectionIdx >= 0 ? (row[sectionIdx]?.trim() || '') : '';
-      const curriculum   = curriculumIdx >= 0 && row[curriculumIdx]?.trim() ? row[curriculumIdx].trim() : defaultCurriculum;
+      const curriculum   = normalizeCurriculum(resolveCurriculum(ctx.curriculum, grade))
+        || (curriculumIdx >= 0 && row[curriculumIdx]?.trim() ? normalizeCurriculum(row[curriculumIdx]) : defaultCurriculum);
       const school       = schoolIdx >= 0 ? (row[schoolIdx]?.trim() || '') : '';
       const parentName   = parentNameIdx  >= 0 ? (row[parentNameIdx]?.trim() || '')  : '';
       const parentEmailIn = parentEmailIdx >= 0 ? (row[parentEmailIdx]?.trim().toLowerCase() || '') : '';
@@ -660,10 +710,14 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
           continue;
         }
 
-        const password = generateSecurePassword();
+        // Real emails get an invite + verification (no password handed out);
+        // auto-generated logins keep the credentials flow.
+        const invited = isRealEmail(studentEmail) && Boolean(firebaseAdmin);
+        const password = invited ? null : generateSecurePassword();
 
-        // Create Firebase account server-side via REST API
-        const firebaseUid = await createFirebaseAccount(studentEmail, password);
+        const firebaseUid = invited
+          ? (await createInvitedFirebaseUser(studentEmail, cleanName)).uid
+          : await createFirebaseAccount(studentEmail, password);
 
         // Save to Supabase
         const userId = randomUUID();
@@ -671,7 +725,7 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
 
         const { error: userErr } = await supabase.from('users').upsert({
           id: userId, name: cleanName, email: studentEmail, role: 'student',
-          grade, section, curriculum, school, onboarding_complete: true,
+          grade, section, curriculum, school: ctx.school, school_id: ctx.schoolId, onboarding_complete: true,
         }, { onConflict: 'id' });
         if (userErr) throw new Error(userErr.message);
 
@@ -683,7 +737,10 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
 
         await supabase.from('user_preferences').upsert({
           user_email: studentEmail,
-          data: {
+          data: invited ? {
+            studentId: resolvedStudentId, createdByTeacher: cleanTeacherEmail, firebaseUid,
+            accountStatus: 'pending_verification', invitedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+          } : {
             studentId: resolvedStudentId, createdByTeacher: cleanTeacherEmail,
             accountStatus: 'active', firebaseUid, mustChangePassword: true,
             activatedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
@@ -697,12 +754,14 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
         // email with every row after the loop (below) instead of one per student —
         // a large bulk import used to flood their inbox with a separate email per row.
         let resolvedParentEmail = ''; // set to a REAL (CSV-provided) parent email, used to route the student's login when the student has no real inbox
-        if (!studentEmail.endsWith('@aivorah.student') && studentEmail !== cleanTeacherEmail) {
+        if (invited) {
+          await sendInviteAndVerification({ email: studentEmail, name: cleanName, frontendOrigin: req.body?.frontendOrigin });
+        } else if (!studentEmail.endsWith('@aivorah.student') && studentEmail !== cleanTeacherEmail) {
           sendCredentialsEmail({ to: studentEmail, childName: cleanName, loginId: studentEmail, password, studentId: resolvedStudentId })
             .catch(err => console.log('[teacher/bulk-import] student credentials email failed (non-fatal):', err.message));
         }
 
-        results.push({ name: cleanName, email: studentEmail, password, studentId: resolvedStudentId, grade, section, curriculum, role: 'student', status: 'created' });
+        results.push({ name: cleanName, email: studentEmail, password: password || undefined, invited: invited || undefined, studentId: resolvedStudentId, grade, section, curriculum, role: 'student', status: 'created' });
 
         // ── PARENT onboarding (only when a Parent Name is supplied) ──────────
         // Mirrors the School Admin bulk import: create-or-reuse a parent account,
@@ -731,7 +790,7 @@ router.post('/:teacherEmail/students/bulk-import', upload.single('csv'), async (
               const parentUserId = randomUUID();
               const { error: pErr } = await supabase.from('users').insert({
                 id: parentUserId, name: pName, email: parentEmail, role: 'parent',
-                phone: parentPhone || null, school: teacher.school || null,
+                phone: parentPhone || null, school: teacher.school || null, school_id: ctx.schoolId,
                 onboarding_complete: true,
               });
               if (pErr) throw new Error(pErr.message);

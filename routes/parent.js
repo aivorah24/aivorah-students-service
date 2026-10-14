@@ -7,6 +7,7 @@ const { computeLearningProfile, humanizeTopic, sanitizeReport } = require('../se
 const { generateSecurePassword, toTitleCase } = require('../services/studentAccounts');
 const { sendCredentialsEmail, sendEmailOtpCode, sendPasswordResetEmail } = require('../services/mailer');
 const otpStore = require('../services/otpStore');
+const { normalizeCurriculum } = require('../services/curriculum');
 const firebaseAdmin = require('../services/firebaseAdmin');
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -130,7 +131,7 @@ router.get('/:parentEmail/children', async (req, res) => {
       const user = link.users ?? {};
       const s    = statsMap[link.child_id] ?? {};
       const grade = user.grade || 'Grade 3';
-      const curriculum = user.curriculum || 'IB PYP';
+      const curriculum = normalizeCurriculum(user.curriculum || 'IB PYP');
       const totalTopics = await fetchTotalTopics(curriculum, grade);
       return {
         id:               link.child_id,
@@ -280,7 +281,7 @@ router.get('/:parentEmail/children/:childId/ai-report', async (req, res) => {
       || assignmentsDone > 0 || challengesCompleted > 0 || analyticsEvents.length > 0;
     if (!hasActivity) {
       return res.json({
-        student: { name: student.name, grade: student.grade, curriculum: student.curriculum, school: student.school },
+        student: { name: student.name, grade: student.grade, curriculum: normalizeCurriculum(student.curriculum), school: student.school },
         noData: true, generatedAt: new Date().toISOString(),
       });
     }
@@ -296,7 +297,7 @@ router.get('/:parentEmail/children/:childId/ai-report', async (req, res) => {
     const readableTopics     = completedTopics.map(humanizeTopic);
 
     const signalCard = {
-      student:    `${student.name}, ${student.grade}, ${student.curriculum}`,
+      student:    `${student.name}, ${student.grade}, ${normalizeCurriculum(student.curriculum)}`,
       pattern:    profile.learningPattern,
       consistency: profile.consistencySignal,
       topicsCompleted: completedTopics.length,
@@ -415,7 +416,7 @@ ABSOLUTE RULES — breaking even one makes the report invalid:
     };
 
     res.json({
-      student: { name: student.name, grade: student.grade, curriculum: student.curriculum, school: student.school },
+      student: { name: student.name, grade: student.grade, curriculum: normalizeCurriculum(student.curriculum), school: student.school },
       metrics: {
         xp, level, studyTimeMinutes: studyMinutes,
         recentStudyMinutes: totalRecentMinutes,
@@ -482,7 +483,8 @@ router.post(['/children/init-auth', '/:parentEmail/children/init-auth'], async (
 router.post('/:parentEmail/children/link-created', async (req, res) => {
   try {
     const { parentEmail } = req.params;
-    const { firebaseUid, studentId, name, email, grade, curriculum, school = '', initialPassword } = req.body || {};
+    const { firebaseUid, studentId, name, email, grade, curriculum: rawCurriculum, school = '', initialPassword } = req.body || {};
+    const curriculum = normalizeCurriculum(rawCurriculum);
 
     if (!firebaseUid || !name || !email || !grade || !curriculum) {
       return res.status(400).json({ error: 'firebaseUid, name, email, grade, curriculum are required' });
@@ -826,7 +828,7 @@ router.patch('/:parentEmail/children/:childId', async (req, res) => {
     const patch = {};
     if (name)       patch.name       = name.trim();
     if (grade)      patch.grade      = grade;
-    if (curriculum) patch.curriculum = curriculum;
+    if (curriculum) patch.curriculum = normalizeCurriculum(curriculum);
     if (school !== undefined) patch.school = school;
 
     let emailChanged = false;

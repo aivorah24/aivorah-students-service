@@ -105,6 +105,8 @@ describe('GET /parent/:parentEmail/children', () => {
       email: 'riya@example.com',
       grade: 'Grade 11',
       curriculum: 'CBSE',
+      profileGrade: 'Grade 11',
+      profileCurriculum: 'CBSE',
       school: 'Hyderabad International',
       totalTopics: 17,
       xpPoints: 500,
@@ -130,6 +132,34 @@ describe('GET /parent/:parentEmail/children', () => {
 
     expect(res.status).toBe(200);
     expect(res.body[0].totalTopics).toBe(0);
+  });
+
+  test('unset grade/curriculum -> defaults stay, but profileGrade/profileCurriculum are empty', async () => {
+    mockSb.setTable('parent_children', {
+      data: [{ child_id: 'child-1', added_at: null, users: { id: 'child-1', name: 'New', email: 'new@example.com', grade: null, curriculum: null, school: '' } }],
+      error: null,
+    });
+    mockSb.setTable('student_stats', { data: [], error: null });
+    global.fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ totalTopics: 0 }) });
+
+    const res = await request(app).get('/parent/parent@example.com/children');
+
+    expect(res.status).toBe(200);
+    expect(res.body[0]).toMatchObject({ grade: 'Grade 3', curriculum: 'IB PYP', profileGrade: '', profileCurriculum: '' });
+  });
+
+  test('legacy NCERT on the users row -> profileCurriculum is CBSE', async () => {
+    mockSb.setTable('parent_children', {
+      data: [{ child_id: 'child-1', added_at: null, users: { id: 'child-1', name: 'Asha', email: 'asha@example.com', grade: 'Grade 8', curriculum: 'NCERT', school: '' } }],
+      error: null,
+    });
+    mockSb.setTable('student_stats', { data: [], error: null });
+    global.fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ totalTopics: 0 }) });
+
+    const res = await request(app).get('/parent/parent@example.com/children');
+
+    expect(res.status).toBe(200);
+    expect(res.body[0]).toMatchObject({ curriculum: 'CBSE', profileCurriculum: 'CBSE', profileGrade: 'Grade 8' });
   });
 
   test('supabase error on the parent_children lookup -> 500', async () => {

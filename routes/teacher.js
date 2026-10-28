@@ -7,6 +7,7 @@ const { generateParentLoginId } = require('../services/studentAccounts');
 const { getTeacherSchool, resolveCurriculum } = require('../services/teacherSchool');
 const { isRealEmail, createInvitedFirebaseUser, sendInviteAndVerification } = require('../services/studentInvite');
 const { normalizeCurriculum } = require('../services/curriculum');
+const { notifyPromoted } = require('../services/promotionNotify');
 const multer   = require('multer');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
@@ -348,8 +349,10 @@ router.post('/:teacherEmail/students/promote', async (req, res) => {
     if (owned.length) {
       const patch = { grade: targetGrade };
       if (section !== undefined) patch.section = String(section || '').trim() || null;
+      const { data: before } = await supabase.from('users').select('id, role, grade, section').in('id', owned);
       const { error } = await supabase.from('users').update(patch).in('id', owned);
       if (error) return res.status(500).json({ error: error.message });
+      await notifyPromoted(before, { grade: targetGrade, section: patch.section }, { actorEmail: cleanTeacherEmail, actorRole: 'teacher' });
     }
 
     res.json({ promoted: owned.length, skipped, grade: targetGrade, section: section !== undefined ? (String(section || '').trim() || null) : undefined });

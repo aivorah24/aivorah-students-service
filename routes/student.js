@@ -312,8 +312,11 @@ router.get('/:id/mistake-trends', async (req, res) => {
     if (grade)   query = query.eq('grade', grade);
     if (rowLimit) query = query.limit(parseInt(rowLimit) || 200);
 
-    const { data: attempts, error } = await query;
+    const { data: rows, error } = await query;
     if (error) return res.status(500).json({ error: error.message });
+    // Only real quiz tries: completing a lesson also writes a 0-question 100% row
+    // (same rule as leaderboard GET /student/:id/attempts).
+    const attempts = (rows || []).filter(a => a.total_questions || (a.per_question_results || []).length);
 
     // Group by topic
     const byTopic = {};

@@ -165,6 +165,15 @@ router.get('/:parentEmail/children', async (req, res) => {
   }
 });
 
+// The model's JSON reply, or null when it was cut off or isn't valid JSON.
+function parseAIReport(completion) {
+  const choice = completion?.choices?.[0];
+  const text = choice?.message?.content || '';
+  if (choice?.finish_reason === 'length') return null;
+  try { return JSON.parse(text.trim()); } catch { /* may be wrapped in prose */ }
+  try { const m = text.match(/\{[\s\S]*\}/); return m ? JSON.parse(m[0]) : null; } catch { return null; }
+}
+
 // ── GET /parent/:parentEmail/children/:childId/ai-report ──────────────────
 // Two-stage pipeline: deterministic signals (this service) → AI mentor
 // reasoning (Groq). Ported from the monolith's ai-mentor/server/routes/parent.js
@@ -370,7 +379,8 @@ Return ONLY valid JSON, no markdown:
   "message_to_child": "1 warm sentence the parent can read to the child — reference a real topic or streak"
 }`;
 
-    const completion = await groq.chat.completions.create({
+    // gpt-oss reasons before answering and that counts toward max_tokens: low effort + headroom stops the JSON being cut off.
+    const ask = () => groq.chat.completions.create({
       model: 'openai/gpt-oss-120b',
       messages: [
         {
@@ -387,16 +397,14 @@ ABSOLUTE RULES — breaking even one makes the report invalid:
         { role: 'user', content: prompt },
       ],
       temperature: 0.3,
-      max_tokens: 1200,
+      max_tokens: 3000,
+      reasoning_effort: 'low',
+      response_format: { type: 'json_object' },
     });
 
-    let aiReport;
-    try {
-      aiReport = JSON.parse(completion.choices[0].message.content.trim());
-    } catch {
-      const match = completion.choices[0].message.content.match(/\{[\s\S]*\}/);
-      aiReport = match ? JSON.parse(match[0]) : {};
-    }
+    let aiReport = parseAIReport(await ask());
+    if (!aiReport) aiReport = parseAIReport(await ask());
+    if (!aiReport) return res.status(502).json({ error: "Couldn't write the report right now. Please try again." });
 
     aiReport = sanitizeReport(aiReport);
 
@@ -431,6 +439,7 @@ ABSOLUTE RULES — breaking even one makes the report invalid:
     });
   } catch (err) {
     console.error('[ai-report]', err.message);
+    if (err.status === 429) return res.status(503).json({ error: 'The report writer is busy. Please try again in a minute.' });
     res.status(500).json({ error: err.message });
   }
 });

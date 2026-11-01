@@ -162,4 +162,69 @@ describe('GET /parent/:parentEmail/children/:childId/ai-report', () => {
     expect(res.status).toBe(200);
     expect(res.body.report.whats_going_well).not.toMatch(/strong grasp/i);
   });
+
+  describe('AI reply robustness (live bug: report cut off -> JSON parse error shown to parent)', () => {
+    function activeChild() {
+      mockSb.setTable('parent_children', { data: { child_id: 'child-1' }, error: null });
+      mockSb.setTable('users', { data: { name: 'Kai', email: 'kai@example.com', grade: 'Grade 10', curriculum: 'IB MYP', school: '' }, error: null });
+      mockSb.setTable('student_stats', { data: { xp_points: 100, assignments_done: 1 }, error: null });
+      mockSb.setTable('student_daily_log', { data: [], error: null });
+      mockSb.setTable('assignment_submissions', { data: [], error: null });
+      mockSb.setTable('challenge_assignments', { data: [], error: null });
+      mockSb.setTable('analytics_events', { data: [], error: null });
+    }
+    // Real failure captured from gpt-oss-120b: its reasoning used up max_tokens and the JSON was cut off.
+    const truncated = {
+      choices: [{
+        finish_reason: 'length',
+        message: { content: JSON.stringify({ learning_pattern_insight: 'x', subject_insights: [{ subject: 'Maths', insight: 'struggling.' }], consistency_insight: 'With a streak of zero days' }, null, 2).slice(0, -30) },
+      }],
+    };
+    const good = (o) => ({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(aiReportJson(o)) } }] });
+
+    test('asks Groq for JSON mode, low reasoning and enough tokens so the reply is not cut off', async () => {
+      activeChild();
+      await request(app).get('/parent/parent@example.com/children/child-1/ai-report');
+
+      const args = mockGroqCreate.mock.calls[0][0];
+      expect(args.response_format).toEqual({ type: 'json_object' });
+      expect(args.reasoning_effort).toBe('low');
+      expect(args.max_tokens).toBeGreaterThanOrEqual(2500);
+    });
+
+    test('a cut-off reply is retried once and the second report is returned', async () => {
+      activeChild();
+      mockGroqCreate.mockResolvedValueOnce(truncated).mockResolvedValueOnce(good({ whats_going_well: 'second try' }));
+
+      const res = await request(app).get('/parent/parent@example.com/children/child-1/ai-report');
+
+      expect(res.status).toBe(200);
+      expect(mockGroqCreate).toHaveBeenCalledTimes(2);
+      expect(res.body.report.whats_going_well).toBe('second try');
+    });
+
+    test('two broken replies -> friendly error, never the raw JSON parse message', async () => {
+      activeChild();
+      mockGroqCreate.mockResolvedValue(truncated);
+
+      const res = await request(app).get('/parent/parent@example.com/children/child-1/ai-report');
+
+      expect(res.status).toBe(502);
+      expect(mockGroqCreate).toHaveBeenCalledTimes(2);
+      expect(res.body.error).not.toMatch(/JSON|position|array element/i);
+      expect(res.body.error).toMatch(/try again/i);
+    });
+
+    test('Groq rate limit (429) -> friendly "busy" error, no retry storm', async () => {
+      activeChild();
+      mockGroqCreate.mockRejectedValue(Object.assign(new Error('429 Rate limit reached for model openai/gpt-oss-120b in organization org_x'), { status: 429 }));
+
+      const res = await request(app).get('/parent/parent@example.com/children/child-1/ai-report');
+
+      expect(res.status).toBe(503);
+      expect(mockGroqCreate).toHaveBeenCalledTimes(1);
+      expect(res.body.error).not.toMatch(/org_|Rate limit reached/);
+      expect(res.body.error).toMatch(/try again/i);
+    });
+  });
 });

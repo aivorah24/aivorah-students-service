@@ -65,4 +65,32 @@ describe('GET /student/:id/mistake-trends', () => {
     expect(res.body.topics).toHaveLength(1);
     expect(res.body.recentMistakes).toHaveLength(1);
   });
+
+  test('ignores the 0-question 100% row a lesson completion writes', async () => {
+    const row = (score, q, at) => ({ topic: 'Poem', subject: 'Hindi', grade: 'Grade 10', attempt_number: 1, score, passed: score >= 60,
+      total_questions: q, correct_answers: Math.round(q * score / 100), time_spent_seconds: q ? 29 : 0, created_at: at, per_question_results: [] });
+    mockSb.setTable('topic_attempts', {
+      data: [row(100, 0, '2026-10-28T15:25:19Z'), row(80, 5, '2026-10-28T15:25:18Z')],
+      error: null,
+    });
+
+    const res = await request(app).get('/student/child-1/mistake-trends');
+
+    expect(res.status).toBe(200);
+    expect(res.body.topics).toHaveLength(1);
+    expect(res.body.topics[0]).toMatchObject({ totalAttempts: 1, bestScore: 80, latestScore: 80, totalTimeSeconds: 29 });
+    expect(res.body.summary.totalAttempts).toBe(1);
+  });
+
+  test('a topic only completed (never quizzed) is not a practice test', async () => {
+    mockSb.setTable('topic_attempts', {
+      data: [{ topic: 'Poem', subject: 'Hindi', score: 100, passed: true, total_questions: 0, time_spent_seconds: 0, created_at: '2026-10-28T00:00:00Z', per_question_results: [] }],
+      error: null,
+    });
+
+    const res = await request(app).get('/student/child-1/mistake-trends');
+
+    expect(res.body.topics).toEqual([]);
+    expect(res.body.summary.totalAttempts).toBe(0);
+  });
 });
